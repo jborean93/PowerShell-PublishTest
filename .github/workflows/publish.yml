@@ -1,0 +1,97 @@
+name: Build, Test, and Publish Module
+
+on:
+  push:
+    branches:
+    - main
+
+  pull_request:
+    branches:
+    - main
+
+  release:
+    types:
+    - published
+
+jobs:
+  test_build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Test module
+        shell: pwsh
+        run: ./test.ps1
+
+      - name: Build nupkg
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Upload nupkg artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: PSModule
+          path: ./output/*.nupkg
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: test_build
+
+    permissions:
+      contents: write  # Needed to publish GitHub release asset
+      packages: write  # Needed to publish to GitHub OCI Repository
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Download nupkg artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: PSModule
+          path: ./output
+
+      - name: Upload nupkg to Release
+        if: startsWith(github.event.release.tag_name, 'v')
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $nupkgPath = (Get-Item -Path './output/*.nupkg').FullName
+          $ghEvent = Get-Content -LiteralPath $env:GITHUB_EVENT_PATH | ConvertFrom-Json
+
+          gh release upload $ghEvent.release.tag_name $nupkgPath
+
+      - name: Publish to GitHub OCI Repository
+        if: startsWith(github.event.release.tag_name, 'v')
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Import-Module -Name Microsoft.PowerShell.PSResourceGet -MinimumVersion 1.1.1
+
+          $nupkgPath = (Get-Item -Path './output/*.nupkg').FullName
+
+          $ociRepoUrl = 'https://ghcr.io/${{ github.repository_owner }}'
+          $pat = ConvertTo-SecureString $env:GITHUB_TOKEN -AsPlainText -Force
+          $cred = [PSCredential]::new('${{ github.repository_owner }}', $pat)
+
+          $repoParams = @{
+              Name = 'GitHubOCI'
+              Uri = $ociRepoUrl
+              Trusted = $true
+              ApiVersion = 'ContainerRegistry'
+          }
+          Register-PSResourceRepository @repoParams -Verbose
+          try {
+              Publish-PSResource -NupkgPath $nupkgPath -Repository $repoParams.Name -Credential $cred -Verbose -Debug
+          }
+          finally {
+              Unregister-PSResourceRepository -Name $repoParams.Name
+          }
