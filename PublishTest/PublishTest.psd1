@@ -18,5 +18,7 @@
             ProjectUri = 'https://github.com/jborean93/PowerShell-PublishTest'
             ReleaseNotes = 'Release notes here'
         }
+        # Used in OCI image anotations
+        SPDXLicense = 'MIT'
     }
 }

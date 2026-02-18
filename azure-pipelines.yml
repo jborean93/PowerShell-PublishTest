@@ -1,0 +1,75 @@
+trigger:
+  branches:
+    include:
+    - main
+
+  tags:
+    include:
+    - v*
+
+pr:
+  branches:
+    include:
+    - main
+
+variables:
+  - name: isRelease
+    value: $[startsWith(variables['Build.SourceBranch'], 'refs/tags/v')]
+  - name: nugetFeed
+    value: NugetTest
+
+stages:
+- stage: TestBuild
+  displayName: Test and Build
+  jobs:
+  - job: TestBuild
+    displayName: Test and Build Module
+    pool:
+      vmImage: ubuntu-latest
+
+    steps:
+    - task: PowerShell@2
+      displayName: Test Module
+      inputs:
+        targetType: filePath
+        filePath: ./test.ps1
+        pwsh: true
+
+    - task: PowerShell@2
+      displayName: Build nupkg
+      inputs:
+        targetType: filePath
+        filePath: ./build.ps1
+        pwsh: true
+
+    - task: PublishPipelineArtifact@1
+      displayName: Upload nupkg Artifact
+      inputs:
+        targetPath: ./output
+        artifactName: PSModule
+        publishLocation: pipeline
+
+- stage: Publish
+  displayName: Publish Module
+  dependsOn: TestBuild
+  jobs:
+  - job: Publish
+    displayName: Publish to Azure Artifacts
+    pool:
+      vmImage: ubuntu-latest
+
+    steps:
+    - download: current
+      displayName: Download nupkg Artifact
+      artifact: PSModule
+
+    - task: NuGetAuthenticate@1
+      displayName: NuGet Authenticate
+
+    - task: DotNetCoreCLI@2
+      displayName: Push package
+      condition: eq(variables.isRelease, true)
+      inputs:
+        command: push
+        packagesToPush: '$(Pipeline.Workspace)/PSModule/*.nupkg'
+        publishVstsFeed: '$(System.TeamProject)/$(nugetFeed)'

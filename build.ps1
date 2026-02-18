@@ -47,6 +47,4 @@ Write-Host "Publishing module nupkg to output repository..." -ForegroundColor Cy
 Compress-PSResource -Path $modulePath -DestinationPath $outputDir -SkipModuleManifestValidate
 
 $nupkgPath = [Path]::Combine($outputDir, "PublishTest.$($manifest.Version).nupkg")
-Write-Host "Successfully created; $nupkgPath" -ForegroundColor Green
-
-$nupkgPath
+Write-Host "Successfully created '$nupkgPath'" -ForegroundColor Green
