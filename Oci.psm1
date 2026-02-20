@@ -5,7 +5,6 @@
 
 using namespace System.Collections
 using namespace System.Collections.Generic
-using namespace System.Diagnostics.CodeAnalysis
 using namespace System.IO
 using namespace System.IO.Compression
 using namespace System.Management.Automation
@@ -30,11 +29,6 @@ Class OciLayer {
     [string]$Digest
     [long]$Size
     [IDictionary]$Annotations
-}
-
-Enum CredentialType {
-    Default
-    AzureAccessToken
 }
 
 Function Get-NupkgMetadata {
@@ -129,11 +123,8 @@ Function Get-NupkgMetadata {
 }
 
 Function Invoke-OciV2GetRequest {
-    [SuppressMessageAttribute(
-        'PSAvoidUsingPlainTextForPassword', '',
-        Justification='CredentialType does not contain sensitive info, it is a switch like param')]
     [OutputType([string])]
-    [CmdletBinding()]
+    [CmdletBinding(DefaultParameterSetName = 'Credential')]
     param (
         [Parameter(Mandatory)]
         [string]
@@ -143,7 +134,7 @@ Function Invoke-OciV2GetRequest {
         [string]
         $Endpoint,
 
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory, ParameterSetName = 'Credential')]
         [string]
         $Scope,
 
@@ -151,13 +142,14 @@ Function Invoke-OciV2GetRequest {
         [switch]
         $AllowNoToken,
 
-        [Parameter()]
+        [Parameter(ParameterSetName = 'Credential')]
         [PSCredential]
         $Credential,
 
-        [Parameter()]
-        [CredentialType]
-        $CredentialType = [CredentialType]::Default,
+        [Parameter(Mandatory, ParameterSetName = 'Token')]
+        [AllowNull()]
+        [SecureString]
+        $Token,
 
         [Parameter()]
         [switch]
@@ -167,14 +159,18 @@ Function Invoke-OciV2GetRequest {
     $ErrorActionPreference = 'Stop'
 
     try {
-        $bearerParams = @{
-            Registry = $Registry
-            Scope = $Scope
-            Credential = $Credential
-            CredentialType = $CredentialType
-            AllowNoToken = $AllowNoToken
+        $accessToken = if ($PSCmdlet.ParameterSetName -eq 'Token') {
+            $Token
         }
-        $accessToken = Get-OciBearerToken @bearerParams
+        else {
+            $bearerParams = @{
+                Registry = $Registry
+                Scope = $Scope
+                Credential = $Credential
+                AllowNoToken = $AllowNoToken
+            }
+            Get-OciBearerToken @bearerParams
+        }
 
         $getParams = @{
             Headers = @{
@@ -494,16 +490,10 @@ Function Get-OciBearerToken {
     GHCR the username is the GH username and password is the classic PAT with
     read:package (and write:package for push).
 
-    .PARAMETER CredentialType
-    Provide additional context to the function that can transform the provided
-    Credential into what is needed by the Basic auth token exchange.
-
-    The 'Default' type does nothing and will use the provided credential as is.
-
-    The 'AzureAccessToken' will request an ACR refresh token using the
-    /oauth2/exchange registry endpoint. The input credential username should
-    be the Entra Tenant Id (GUID) and password the access token returned by
-    functions like `(Get-AzAccessToken -AsSecureString).Token`.
+    If the username is in the format 'AzureAccessToken: GUID' then the
+    credential is treated as an Azure Access Token and will be exchanged using
+    an ACR specific endpoint. This format is used when authenticating with a
+    credential returned by Get-AzAccessToken.
 
     .PARAMETER ClientId
     An identifier for the bearer token request, this is used for auditing on
@@ -523,9 +513,6 @@ Function Get-OciBearerToken {
     'repository:*:pull'. Future work could validate the JWT token returned
     but this seems registry specific.
     #>
-    [SuppressMessageAttribute(
-        'PSAvoidUsingPlainTextForPassword', '',
-        Justification='CredentialType does not contain sensitive info, it is a switch like param')]
     [OutputType([SecureString])]
     [CmdletBinding()]
     param (
@@ -540,10 +527,6 @@ Function Get-OciBearerToken {
         [Parameter()]
         [PSCredential]
         $Credential,
-
-        [Parameter()]
-        [CredentialType]
-        $CredentialType = [CredentialType]::Default,
 
         [Parameter()]
         [string]
@@ -580,27 +563,27 @@ Function Get-OciBearerToken {
             throw "Could not extract service from WWW-Authenticate header '$bearer'"
         }
 
-        if ($CredentialType -eq [CredentialType]::AzureAccessToken) {
-            if (-not $Credential -or $Credential -eq [PSCredential]::Empty) {
-                throw "-CredentialType AzureAccessToken can only be used with a valid credential"
-            }
-
-            # If we have an access token returned from something like
-            # Get-AzAccessToken, we need to use an ACR specific API to exchange
-            # that to an ACR refresh token.
+        if ($Credential -and $Credential.UserName -match "^AzureAccessToken: ([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$") {
+            # The 'AzureAccessToken: ...' prefix is a special marker that
+            # indicates the credential is an Azure Access Token returned from
+            # something like Get-AzAccessToken. We need to use an ACR specific
+            # API endpoint to exchange this token for an ACR refresh token that
+            # is used to get the bearer token below.
             # https://azure.github.io/acr/AAD-OAuth.html#calling-post-oauth2-exchange-to-get-an-acr-refresh-token
+
+            $tenantId = $Matches[1]
             $exchangeParams = @{
                 Body = @{
                     access_token = $Credential.GetNetworkCredential().Password
                     grant_type = 'access_token'
                     service = $service
-                    tenant = $Credential.UserName
+                    tenant = $tenantId
                 }
                 ContentType = 'application/x-www-form-urlencoded'
                 Method = 'Post'
                 Uri = "https://$Registry/oauth2/exchange"
             }
-            Write-Verbose -Message "Getting ACR refresh token from '$($exchangeParams.Uri)' for tenant '$($Credential.UserName)' and service '$service'"
+            Write-Verbose -Message "Getting ACR refresh token from '$($exchangeParams.Uri)' for tenant '$tenantId' and service '$service'"
             $exchangeResp = Invoke-RestMethod @exchangeParams
             Write-Verbose -Message "Received ACR refresh token '$($exchangeResp.refresh_token)'"
 
@@ -648,6 +631,362 @@ Function Get-OciBearerToken {
     }
 }
 
+Function Get-OciPackageManifest {
+    <#
+    .SYNOPSIS
+    Gets the OCI manifest JSON for a package version.
+
+    .PARAMETER Registry
+    The registry the package is part of.
+
+    .PARAMETER PackageName
+    The name of the package.
+
+    .PARAMETER Version
+    The version/tag of the package
+
+    .PARAMETER Credential
+    The access token to use for authentication. See Get-OciBearerToken for more
+    information.
+    #>
+    [OutputType([PSObject])]
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]
+        $Registry,
+
+        [Parameter(Mandatory)]
+        [string]
+        $PackageName,
+
+        [Parameter(Mandatory)]
+        [string]
+        $Version,
+
+        [Parameter()]
+        [PSCredential]
+        $Credential
+    )
+
+    $ErrorActionPreference = 'Stop'
+
+    try {
+        $PackageName = $PackageName.ToLowerInvariant()
+
+        $getParams = @{
+            Endpoint = "$PackageName/manifests/$Version"
+            Scope = "repository:${PackageName}:pull"
+
+            Registry = $Registry
+            Credential = $Credential
+            AllowNoToken = $true
+        }
+        Invoke-OciV2GetRequest @getParams
+    }
+    catch {
+        $PSCmdlet.WriteError($_)
+    }
+}
+
+Function Get-OciPackageTags {
+    <#
+    .SYNOPSIS
+    Gets the tags/versions for an OCI package.
+
+    .PARAMETER Registry
+    The registry the package is part of.
+
+    .PARAMETER PackageName
+    The name of the package.
+
+    .PARAMETER Credential
+    The access token to use for authentication. See Get-OciBearerToken for more
+    information.
+    #>
+    [OutputType([string])]
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]
+        $Registry,
+
+        [Parameter(Mandatory)]
+        [string]
+        $PackageName,
+
+        [Parameter()]
+        [PSCredential]
+        $Credential
+    )
+
+    $ErrorActionPreference = 'Stop'
+
+    try {
+        $PackageName = $PackageName.ToLowerInvariant()
+
+        $getParams = @{
+            Endpoint = "$PackageName/tags/list"
+            Scope = "repository:${PackageName}:pull"
+
+            Registry = $Registry
+            Credential = $Credential
+            AllowNoToken = $true
+        }
+        Invoke-OciV2GetRequest @getParams | Select-Object -ExpandProperty tags
+    }
+    catch {
+        $PSCmdlet.WriteError($_)
+    }
+}
+
+Function Get-OciRegistryPackages {
+    <#
+    .SYNOPSIS
+    Gets the packages in an OCI registry.
+
+    .PARAMETER Registry
+    The registry to list the packages for.
+
+    .PARAMETER Credential
+    The access token to use for authentication. See Get-OciBearerToken for more
+    information.
+
+    .NOTES
+    The endpoint used for this functionality is not part of the OCI
+    specification. Some endpoints may not support this or may require
+    authentication.
+    #>
+    [OutputType([string])]
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]
+        $Registry,
+
+        [Parameter()]
+        [PSCredential]
+        $Credential
+    )
+
+    $ErrorActionPreference = 'Stop'
+
+    try {
+        $getParams = @{
+            Endpoint = "_catalog?n=$([Int32]::MaxValue)"
+            Scope = "registry:catalog:*"
+
+            Registry = $Registry
+            Credential = $Credential
+            AllowNoToken = $true
+        }
+        Invoke-OciV2GetRequest @getParams -AllowPagination | Select-Object -ExpandProperty repositories
+    }
+    catch {
+        $PSCmdlet.WriteError($_)
+    }
+}
+
+Function Install-OciNupkg {
+    <#
+    .SYNOPSIS
+    Installs the PowerShell module as a local .nupkg package.
+
+    .DESCRIPTION
+    This function can download/install a module nupkg from an OCI compliant
+    registry. It won't unpack the nupkg, just download it from the registry.
+
+    .PARAMETER Registry
+    The registry to install the package from.
+
+    .PARAMETER PackageName
+    The name of the package to install.
+
+    .PARAMETER Version
+    The version/tag to install, will default to the latest version if unset.
+
+    .PARAMETER Path
+    The path to download the nupkg to, defaults to the current location if
+    unset.
+
+    .PARAMETER Credential
+    The access token to use for authentication. See Get-OciBearerToken for more
+    information.
+    #>
+    [OutputType([IO.FileInfo])]
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]
+        $Registry,
+
+        [Parameter(Mandatory)]
+        [string]
+        $PackageName,
+
+        [Parameter()]
+        [string]
+        $Version,
+
+        [Parameter()]
+        [string]
+        $Path,
+
+        [Parameter()]
+        [PSCredential]
+        $Credential
+    )
+
+    $ErrorActionPreference = 'Stop'
+
+    $hashAlgo = $fs = $nupkgPathTempName = $null
+    try {
+        if (-not $Path) {
+            $Path = "."
+        }
+        $resolvedPath = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($Path)
+        if (-not (Test-Path -LiteralPath $resolvedPath)) {
+            throw "-Path '$resolvedPath' does not exist, cannot install nupkg here"
+        }
+
+        $PackageName = $PackageName.ToLowerInvariant()
+
+        $bearerParams = @{
+            Registry = $Registry
+            Scope = "repository:${PackageName}:pull"
+            Credential = $Credential
+            AllowNoToken = $true
+        }
+        $accessToken = Get-OciBearerToken @bearerParams
+
+        $getParams = @{
+            Endpoint = "$PackageName/tags/list"
+
+            Registry = $Registry
+            Token = $accessToken
+        }
+        $tags = Invoke-OciV2GetRequest @getParams | Select-Object -ExpandProperty tags
+
+        if ($Version) {
+            if ($Version -notin $tags) {
+                throw "Failed to find package version $Version in existing versions: $($tags -join ", ")"
+            }
+        }
+        else {
+            # This is super naive but just here for the POC
+            $Version = $tags |
+                ForEach-Object {
+                    $v = $_ -as [version]
+                    if ($v) {
+                        [PSCustomObject]@{Raw = $_; Version = $v }
+                    }
+                } |
+                Sort-Object -Property Version -Descending |
+                Select-Object -First 1 -ExpandProperty Raw
+
+            if (-not $Version) {
+                throw "Failed to find latest version in package list: $($tags -join ", ")"
+            }
+        }
+
+        Write-Verbose -Message "Getting manifest information for ${PackageName}:$Version"
+
+        $getParams.Endpoint = "${PackageName}/manifests/$Version"
+        $manifest = Invoke-OciV2GetRequest @getParams
+
+        $nupkgLayer = $manifest.layers | ForEach-Object -Process {
+            Write-Verbose -Message "Processing layer '$($_.mediaType)' $($_.digest)"
+
+            if ($_.mediaType -ne 'application/vnd.oci.image.layer.v1.tar+gzip') {
+                Write-Verbose -Message "Layer did not match expected mediaType"
+                return
+            }
+            $annotations = $_.annotations
+            if (-not $annotations) {
+                Write-Verbose -Message "Layer did not contains annotations property"
+                return
+            }
+            elseif ($annotations.resourceType -ne 'Nupkg') {
+                Write-Verbose -Message "Layer resource type '$($annotations.resourceType)' != 'Nupkg'"
+                return
+            }
+            elseif (-not $annotations.metadata) {
+                Write-Verbose -Message "Layer did not contain module metadata"
+                return
+            }
+            elseif (-not $annotations.'org.opencontainers.image.title') {
+                Write-Verbose -Message "Layer did not contain module name"
+                return
+            }
+            elseif (-not $annotations.'org.opencontainers.image.description') {
+                Write-Verbose -Message "Layer did not contain module nupkg filename"
+                return
+            }
+
+            [PSCustomObject]@{
+                MediaType = $_.mediaType
+                Digest = $_.digest
+                Size = $_.size
+                ModuleName = $annotations.'org.opencontainers.image.title'
+                NupkgFileName = $annotations.'org.opencontainers.image.description'
+                Metadata = $annotations.metadata
+            }
+        } | Select-Object -First 1
+        if (-not $nupkgLayer) {
+            throw "Failed to find nupkg layer in OCI manifest"
+        }
+        $hashAlgo, $expectedDigest = switch ($nupkgLayer.Digest) {
+            { $_.StartsWith('sha256:') } { [SHA256]::Create(); $_.Substring(7) }
+            { $_.StartsWith('sha512:') } { [SHA512]::Create(); $_.Substring(7) }
+            default { throw "Unknown digest type '$($nupkgLayer.Digest)'" }
+        }
+
+        # We use a temp file in the same dir as we still want to validate the
+        # digest is what we expect. It'll be renamed at the end once validated.
+        $nupkgPath = Join-Path -Path $resolvedPath -ChildPath $nupkgLayer.NupkgFileName
+        $nupkgPathTempName = "$nupkgPath.tmp"
+        $downloadParams = @{
+            Headers = @{
+                Access = $nupkgLayer.MediaType
+            }
+            Method = 'Get'
+            OutFile = $nupkgPathTempName
+            Uri = "https://$Registry/v2/$PackageName/blobs/$($nupkgLayer.Digest)"
+        }
+        if ($accessToken) {
+            $downloadParams.Authentication = 'Bearer'
+            $downloadParams.Token = $accessToken
+        }
+        Write-Verbose -Message "Download OCI blob from '$($downloadParams.Uri)' to '$nupkgPathTempName'"
+        Invoke-WebRequest @downloadParams
+
+        Write-Verbose -Message "Validating downloaded blob hash matches manifest hash"
+        $fs = [File]::OpenRead($nupkgPathTempName)
+        $actualDigest = [Convert]::ToHexString($hashAlgo.ComputeHash($fs)).ToLowerInvariant()
+        $fs.Dispose()
+
+        if ($actualDigest -ne $expectedDigest) {
+            throw "Downloaded digest '$actualDigest' not equal to expected digest '$expectedDigest'"
+        }
+
+        Write-Verbose -Message "Renaming temp nupkg path to final package path-"
+        [File]::Move($nupkgPathTempName, $nupkgPath, [NullString]::Value)
+
+        Get-Item -LiteralPath $nupkgPath
+    }
+    catch {
+        $PSCmdlet.WriteError($_)
+    }
+    finally {
+        ${hashAlgo}?.Dispose()
+        ${fs}?.Dispose()
+
+        if ($nupkgPathTempName -and (Test-Path -LiteralPath $nupkgPathTempName)) {
+            Remove-Item -LiteralPath $nupkgPathTempName -Force
+        }
+    }
+}
+
 Function Publish-NupkgToOci {
     <#
     .SYNOPSIS
@@ -670,10 +1009,6 @@ Function Publish-NupkgToOci {
 
     .PARAMETER Credential
     The access token to use for authentication. See Get-OciBearerToken for more
-    information.
-
-    .PARAMETER CredentialType
-    The type of credential that is being used. See Get-OciBearerToken for more
     information.
 
     .PARAMETER PackageName
@@ -726,21 +1061,17 @@ Function Publish-NupkgToOci {
 
         # Retrieve the Azure Access Token for the connection.
         $azToken = Get-AzAccessToken -AsSecureString
-        $cred = [PSCredential]::new($azToken.TenantId, $azToken.Token)
+        $cred = [PSCredential]::new(
+            "AzureAccessToken: $($azToken.TenantId)",
+            $azToken.Token)
 
         $publishParams = @{
             Registry = 'acrname.azurecr.io'
             Path = './MyModule.nupkg'
             Credential = $cred
-            # Tell the publisher this is an AzureAccessToken so it can use it
-            # properly.
-            CredentialType = 'AzureAccessToken'
         }
         Publish-NupkgToOci @publishParams
     #>
-    [SuppressMessageAttribute(
-        'PSAvoidUsingPlainTextForPassword', '',
-        Justification='CredentialType does not contain sensitive info, it is a switch like param')]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -754,10 +1085,6 @@ Function Publish-NupkgToOci {
         [Parameter(Mandatory)]
         [PSCredential]
         $Credential,
-
-        [Parameter()]
-        [CredentialType]
-        $CredentialType = [CredentialType]::Default,
 
         [Parameter()]
         [string]
@@ -809,7 +1136,6 @@ Function Publish-NupkgToOci {
             Registry = $Registry
             Scope = "repository:${nameToPublish}:pull,push"
             Credential = $Credential
-            CredentialType = $CredentialType
         }
         $accessToken = Get-OciBearerToken @bearerParams
         $commonPublish = @{
@@ -837,198 +1163,11 @@ Function Publish-NupkgToOci {
     }
 }
 
-Function Get-OciPackageManifest {
-    <#
-    .SYNOPSIS
-    Gets the OCI manifest JSON for a package version.
-
-    .PARAMETER Registry
-    The registry the package is part of.
-
-    .PARAMETER PackageName
-    The name of the package.
-
-    .PARAMETER Version
-    The version/tag of the package
-
-    .PARAMETER Credential
-    The access token to use for authentication. See Get-OciBearerToken for more
-    information.
-
-    .PARAMETER CredentialType
-    The type of credential that is being used. See Get-OciBearerToken for more
-    information.
-    #>
-    [SuppressMessageAttribute(
-        'PSAvoidUsingPlainTextForPassword', '',
-        Justification='CredentialType does not contain sensitive info, it is a switch like param')]
-    [OutputType([PSObject])]
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory)]
-        [string]
-        $Registry,
-
-        [Parameter(Mandatory)]
-        [string]
-        $PackageName,
-
-        [Parameter(Mandatory)]
-        [string]
-        $Version,
-
-        [Parameter()]
-        [PSCredential]
-        $Credential,
-
-        [Parameter()]
-        [CredentialType]
-        $CredentialType = [CredentialType]::Default
-    )
-
-    $ErrorActionPreference = 'Stop'
-
-    try {
-        $PackageName = $PackageName.ToLowerInvariant()
-
-        $getParams = @{
-            Endpoint = "$PackageName/manifests/$Version"
-            Scope = "repository:${PackageName}:pull"
-
-            Registry = $Registry
-            Credential = $Credential
-            CredentialType = $CredentialType
-            AllowNoToken = $true
-        }
-        Invoke-OciV2GetRequest @getParams
-    }
-    catch {
-        $PSCmdlet.WriteError($_)
-    }
-}
-
-Function Get-OciPackageTags {
-    <#
-    .SYNOPSIS
-    Gets the tags/versions for an OCI package.
-
-    .PARAMETER Registry
-    The registry the package is part of.
-
-    .PARAMETER PackageName
-    The name of the package.
-
-    .PARAMETER Credential
-    The access token to use for authentication. See Get-OciBearerToken for more
-    information.
-
-    .PARAMETER CredentialType
-    The type of credential that is being used. See Get-OciBearerToken for more
-    information.
-    #>
-    [SuppressMessageAttribute(
-        'PSAvoidUsingPlainTextForPassword', '',
-        Justification='CredentialType does not contain sensitive info, it is a switch like param')]
-    [OutputType([string])]
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory)]
-        [string]
-        $Registry,
-
-        [Parameter(Mandatory)]
-        [string]
-        $PackageName,
-
-        [Parameter()]
-        [PSCredential]
-        $Credential,
-
-        [Parameter()]
-        [CredentialType]
-        $CredentialType = [CredentialType]::Default
-    )
-
-    $ErrorActionPreference = 'Stop'
-
-    try {
-        $PackageName = $PackageName.ToLowerInvariant()
-
-        $getParams = @{
-            Endpoint = "$PackageName/tags/list"
-            Scope = "repository:${PackageName}:pull"
-
-            Registry = $Registry
-            Credential = $Credential
-            CredentialType = $CredentialType
-            AllowNoToken = $true
-        }
-        $resp = Invoke-OciV2GetRequest @getParams
-
-        $resp.tags
-    }
-    catch {
-        $PSCmdlet.WriteError($_)
-    }
-}
-
-Function Get-OciRegistryPackages {
-    <#
-    .SYNOPSIS
-    Gets the packages in an OCI registry.
-
-    .PARAMETER Registry
-    The registry to list the packages for.
-
-    .PARAMETER Credential
-    The access token to use for authentication. See Get-OciBearerToken for more
-    information.
-
-    .PARAMETER CredentialType
-    The type of credential that is being used. See Get-OciBearerToken for more
-    information.
-
-    .NOTES
-    The endpoint used for this functionality is not part of the OCI
-    specification. Some endpoints may not support this or may require
-    authentication.
-    #>
-    [SuppressMessageAttribute(
-        'PSAvoidUsingPlainTextForPassword', '',
-        Justification='CredentialType does not contain sensitive info, it is a switch like param')]
-    [OutputType([string])]
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory)]
-        [string]
-        $Registry,
-
-        [Parameter()]
-        [PSCredential]
-        $Credential,
-
-        [Parameter()]
-        [CredentialType]
-        $CredentialType = [CredentialType]::Default
-    )
-
-    $ErrorActionPreference = 'Stop'
-
-    try {
-        $getParams = @{
-            Endpoint = "_catalog?n=$([Int32]::MaxValue)"
-            Scope = "registry:catalog:*"
-
-            Registry = $Registry
-            Credential = $Credential
-            CredentialType = $CredentialType
-            AllowNoToken = $true
-        }
-        Invoke-OciV2GetRequest @getParams -AllowPagination | Select-Object -ExpandProperty repositories
-    }
-    catch {
-        $PSCmdlet.WriteError($_)
-    }
-}
-
-Export-ModuleMember -Function Get-OciBearerToken, Get-OciPackageManifest, Get-OciPackageTags, Get-OciRegistryPackages, Publish-NupkgToOci
+Export-ModuleMember -Function @(
+    'Get-OciBearerToken'
+    'Get-OciPackageManifest'
+    'Get-OciPackageTags'
+    'Get-OciRegistryPackages'
+    'Install-OciNupkg'
+    'Publish-NupkgToOci'
+)

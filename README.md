@@ -102,8 +102,8 @@ Install-PSResource -Name jborean93/publishtest -Repository GHCR -TrustRepository
 
 There are two issues that stop this from working.
 
-+ The anonymous token logic is designed only for Azure rather than the OCI specifications
-+ Packages under a prefix (like GitHub OCI packages) fail during the download due to incorrect logic in PSResourceGet.
++ The anonymous token logic is designed only for Azure rather than the OCI specifications - https://github.com/PowerShell/PSResourceGet/issues/1946
++ Packages under a prefix (like GitHub OCI packages) fail during the download due to incorrect logic in PSResourceGet. - https://github.com/PowerShell/PSResourceGet/issues/1947
 
 Using [PSNetDetour](https://github.com/jborean93/PSNetDetour) we can hack in a fix to `PSResourceGet` but this is not recommended at all and will most likely fail on newer PSResourceGet versions as internal methods are changed.
 
