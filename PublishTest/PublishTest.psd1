@@ -1,6 +1,6 @@
 @{
     RootModule = 'PublishTest.psm1'
-    ModuleVersion = '0.1.0'
+    ModuleVersion = '0.1.1'
     GUID = 'c22c1b76-54fe-4e55-a0df-a5a9e2766af7'
     Author = 'Jordan Borean'
     CompanyName = 'Community'

@@ -86,7 +86,7 @@ jobs:
         )
         dotnet @publishArgs
 
-        . ./publish_oci.ps1
+        Import-Module -Name ./Oci.psm1
 
         $cred = [PSCredential]::new(
             $env:GITHUB_OWNER,
@@ -95,5 +95,6 @@ jobs:
             Registry = 'ghcr.io'
             Path = $nupkgPath
             Credential = $cred
+            PackagePrefix = $cred.UserName
         }
         Publish-NupkgToOci @ociParams -Verbose

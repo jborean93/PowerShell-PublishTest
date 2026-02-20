@@ -106,6 +106,8 @@ There are two issues that stop this from working.
 Using [PSNetDetour](https://github.com/jborean93/PSNetDetour) we can hack in a fix to `PSResourceGet` but this is not recommended at all and will most likely fail on newer PSResourceGet versions as internal methods are changed.
 
 ```powershell
+Import-Module ./Oci.psm1
+
 Function Install-GhcrResource {
     [CmdletBinding()]
     param (
@@ -114,9 +116,10 @@ Function Install-GhcrResource {
         $Name
     )
 
-    $packagePrefix, $packageName = $Name -split '/', 2
-
     $ErrorActionPreference = 'Stop'
+
+    $Name = $Name.ToLowerInvariant()
+    $packagePrefix, $packageName = $Name -split '/', 2
 
     $psGetCmd = Get-Command -Name Install-PSResource -Module Microsoft.PowerShell.PSResourceGet
     $psGetType = $psGetCmd.ImplementingType.Assembly.GetType(
@@ -143,38 +146,14 @@ Function Install-GhcrResource {
             param ([ref]$ErrorRecord)
 
             try {
-                $registryUri = "https://$($Detour.Instance.Registry)/v2/"
-                $resp = Invoke-WebRequest -Uri $registryUri -SkipHttpErrorCheck
-                $bearer = $resp.Headers['WWW-Authenticate'] | Select-Object -First 1
-                if (-not $bearer) {
-                    throw "No WWW-Authenticate found in response headers for $registryUri"
-                }
-
-                if ($bearer -match 'realm="([^"]+)"') {
-                    $realm = $matches[1]
-                } else {
-                    throw "Could not extract realm from WWW-Authenticate header '$bearer'"
-                }
-
-                if ($bearer -match 'service="([^"]+)"') {
-                    $service = $matches[1]
-                } else {
-                    throw "Could not extract service from WWW-Authenticate header '$bearer'"
-                }
-
-                $scope = "repository:jborean93/publishtest:pull"
-                $tokenUri = "${realm}?service=${service}&scope=$scope"
-
-                $tokenResponse = Invoke-WebRequest -Uri $tokenUri -Method GET
-                $tokenJson = $tokenResponse.Content | ConvertFrom-Json
-
-                $tokenJson.token
+                # In Oci.psm1
+                Get-OciBearerToken -Registry $Detour.Instance.Registry -PackageName $Detour.State.Name
             }
             catch {
                 $_.ErrorDetails = "Failed to retrieve anonymous token: $_"
                 $ErrorRecord.Value = $_
             }
-        }
+        } -State @{ Name = $Name }
 
         # PSResourceGet is able to find the package metadata if you specify the
         # prefix under -Name like '-Name jborean93/publishtest' but unfortunately
@@ -188,7 +167,7 @@ Function Install-GhcrResource {
             "$($Detour.State.Prefix)/$packageName"
         } -State @{ Prefix = $packagePrefix }
 
-        Install-PSResource -Name publishtest -Repository GHCR -TrustRepository
+        Install-PSResource -Name $packageName -Repository GHCR -TrustRepository
     }
 }
 
