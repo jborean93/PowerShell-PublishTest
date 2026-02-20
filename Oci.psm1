@@ -128,6 +128,91 @@ Function Get-NupkgMetadata {
     }
 }
 
+Function Invoke-OciV2GetRequest {
+    [SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', '',
+        Justification='CredentialType does not contain sensitive info, it is a switch like param')]
+    [OutputType([string])]
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]
+        $Registry,
+
+        [Parameter(Mandatory)]
+        [string]
+        $Endpoint,
+
+        [Parameter(Mandatory)]
+        [string]
+        $Scope,
+
+        [Parameter()]
+        [switch]
+        $AllowNoToken,
+
+        [Parameter()]
+        [PSCredential]
+        $Credential,
+
+        [Parameter()]
+        [CredentialType]
+        $CredentialType = [CredentialType]::Default,
+
+        [Parameter()]
+        [switch]
+        $AllowPagination
+    )
+
+    $ErrorActionPreference = 'Stop'
+
+    try {
+        $bearerParams = @{
+            Registry = $Registry
+            Scope = $Scope
+            Credential = $Credential
+            CredentialType = $CredentialType
+            AllowNoToken = $AllowNoToken
+        }
+        $accessToken = Get-OciBearerToken @bearerParams
+
+        $getParams = @{
+            Headers = @{
+                Accept = 'application/vnd.oci.image.manifest.v1+json'
+            }
+            Method = 'Get'
+            Uri = "https://$Registry/v2/$Endpoint"
+        }
+        if ($accessToken) {
+            $getParams.Authentication = 'Bearer'
+            $getParams.Token = $accessToken
+        }
+
+        while ($true) {
+            Write-Verbose -Message "Sending GET request to '$($getParams.Uri)'"
+            $resp = Invoke-WebRequest @getParams
+
+            # Some response don't contain the application/json Content-Type so we
+            # manually decode the bytes.
+            [string]$json = $resp.Content -is [byte[]] ? [Encoding]::UTF8.GetString($resp.Content) : $resp.Content
+            Write-Verbose -Message "OCI GET response JSON`n$json"
+
+            $json | ConvertFrom-Json
+
+            $link = $resp.Headers['Link'] | Select-Object -First 1
+            if ($AllowPagination -and $link -and $link -match "<(.*)>.*") {
+                $getParams.Uri = "https://$Registry$($Matches[1])"
+                continue
+            }
+
+            break
+        }
+    }
+    catch {
+        $PSCmdlet.WriteError($_)
+    }
+}
+
 Function New-ManifestConfig {
     [OutputType([string])]
     [CmdletBinding()]
@@ -424,6 +509,11 @@ Function Get-OciBearerToken {
     An identifier for the bearer token request, this is used for auditing on
     registry side and doesn't impact the authentication itself.
 
+    .PARAMETER AllowNoToken
+    A switch that will return nothing if the registry did not return a
+    WWW-Authenticate header in the initial response. This is useful for pull
+    operations that may allow unauthenticated requests.
+
     .NOTES
     The auth flow and details are documented under
     https://distribution.github.io/distribution/spec/auth/token/
@@ -435,8 +525,7 @@ Function Get-OciBearerToken {
     #>
     [SuppressMessageAttribute(
         'PSAvoidUsingPlainTextForPassword', '',
-        Justification='CredentialType does not contain sensitive info, it is a switch like param'
-    )]
+        Justification='CredentialType does not contain sensitive info, it is a switch like param')]
     [OutputType([SecureString])]
     [CmdletBinding()]
     param (
@@ -458,7 +547,11 @@ Function Get-OciBearerToken {
 
         [Parameter()]
         [string]
-        $ClientId = 'JboreanOciTest'
+        $ClientId = 'JboreanOciTest',
+
+        [Parameter()]
+        [switch]
+        $AllowNoToken
     )
 
     try {
@@ -466,6 +559,11 @@ Function Get-OciBearerToken {
         $resp = Invoke-WebRequest -Uri $registryUri -SkipHttpErrorCheck
         $bearer = $resp.Headers['WWW-Authenticate'] | Select-Object -First 1
         if (-not $bearer) {
+            if ($AllowNoToken -and $resp.BaseResponse.IsSuccessStatusCode) {
+                Write-Verbose -Message "Registry endpoint did not indicate authentication is required."
+                return
+            }
+
             throw "No WWW-Authenticate found in response headers for '$registryUri'"
         }
         Write-Verbose -Message "Received registry WWW-Authenticate value '$bearer'"
@@ -520,9 +618,13 @@ Function Get-OciBearerToken {
         if ($Credential -and $Credential -ne [PSCredential]::Empty) {
             $webCredentials.Authentication = 'Basic'
             $webCredentials.Credential = $Credential
+            $username = $Credential.UserName
+        }
+        else {
+            $username = 'anonymous'
         }
 
-        Write-Verbose -Message "Requesting bearer token from '$tokenUri'"
+        Write-Verbose -Message "Requesting bearer token for '$username' from '$tokenUri'"
         $tokenResponse = Invoke-WebRequest -Uri $tokenUri -Method Get @webCredentials
         Write-Verbose -Message "Received bearer token JSON response '$($tokenResponse.Content)'"
         $tokenJson = $tokenResponse.Content | ConvertFrom-Json
@@ -638,8 +740,7 @@ Function Publish-NupkgToOci {
     #>
     [SuppressMessageAttribute(
         'PSAvoidUsingPlainTextForPassword', '',
-        Justification='CredentialType does not contain sensitive info, it is a switch like param'
-    )]
+        Justification='CredentialType does not contain sensitive info, it is a switch like param')]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -736,4 +837,198 @@ Function Publish-NupkgToOci {
     }
 }
 
-Export-ModuleMember -Function Get-OciBearerToken, Publish-NupkgToOci
+Function Get-OciPackageManifest {
+    <#
+    .SYNOPSIS
+    Gets the OCI manifest JSON for a package version.
+
+    .PARAMETER Registry
+    The registry the package is part of.
+
+    .PARAMETER PackageName
+    The name of the package.
+
+    .PARAMETER Version
+    The version/tag of the package
+
+    .PARAMETER Credential
+    The access token to use for authentication. See Get-OciBearerToken for more
+    information.
+
+    .PARAMETER CredentialType
+    The type of credential that is being used. See Get-OciBearerToken for more
+    information.
+    #>
+    [SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', '',
+        Justification='CredentialType does not contain sensitive info, it is a switch like param')]
+    [OutputType([PSObject])]
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]
+        $Registry,
+
+        [Parameter(Mandatory)]
+        [string]
+        $PackageName,
+
+        [Parameter(Mandatory)]
+        [string]
+        $Version,
+
+        [Parameter()]
+        [PSCredential]
+        $Credential,
+
+        [Parameter()]
+        [CredentialType]
+        $CredentialType = [CredentialType]::Default
+    )
+
+    $ErrorActionPreference = 'Stop'
+
+    try {
+        $PackageName = $PackageName.ToLowerInvariant()
+
+        $getParams = @{
+            Endpoint = "$PackageName/manifests/$Version"
+            Scope = "repository:${PackageName}:pull"
+
+            Registry = $Registry
+            Credential = $Credential
+            CredentialType = $CredentialType
+            AllowNoToken = $true
+        }
+        Invoke-OciV2GetRequest @getParams
+    }
+    catch {
+        $PSCmdlet.WriteError($_)
+    }
+}
+
+Function Get-OciPackageTags {
+    <#
+    .SYNOPSIS
+    Gets the tags/versions for an OCI package.
+
+    .PARAMETER Registry
+    The registry the package is part of.
+
+    .PARAMETER PackageName
+    The name of the package.
+
+    .PARAMETER Credential
+    The access token to use for authentication. See Get-OciBearerToken for more
+    information.
+
+    .PARAMETER CredentialType
+    The type of credential that is being used. See Get-OciBearerToken for more
+    information.
+    #>
+    [SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', '',
+        Justification='CredentialType does not contain sensitive info, it is a switch like param')]
+    [OutputType([string])]
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]
+        $Registry,
+
+        [Parameter(Mandatory)]
+        [string]
+        $PackageName,
+
+        [Parameter()]
+        [PSCredential]
+        $Credential,
+
+        [Parameter()]
+        [CredentialType]
+        $CredentialType = [CredentialType]::Default
+    )
+
+    $ErrorActionPreference = 'Stop'
+
+    try {
+        $PackageName = $PackageName.ToLowerInvariant()
+
+        $getParams = @{
+            Endpoint = "$PackageName/tags/list"
+            Scope = "repository:${PackageName}:pull"
+
+            Registry = $Registry
+            Credential = $Credential
+            CredentialType = $CredentialType
+            AllowNoToken = $true
+        }
+        $resp = Invoke-OciV2GetRequest @getParams
+
+        $resp.tags
+    }
+    catch {
+        $PSCmdlet.WriteError($_)
+    }
+}
+
+Function Get-OciRegistryPackages {
+    <#
+    .SYNOPSIS
+    Gets the packages in an OCI registry.
+
+    .PARAMETER Registry
+    The registry to list the packages for.
+
+    .PARAMETER Credential
+    The access token to use for authentication. See Get-OciBearerToken for more
+    information.
+
+    .PARAMETER CredentialType
+    The type of credential that is being used. See Get-OciBearerToken for more
+    information.
+
+    .NOTES
+    The endpoint used for this functionality is not part of the OCI
+    specification. Some endpoints may not support this or may require
+    authentication.
+    #>
+    [SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', '',
+        Justification='CredentialType does not contain sensitive info, it is a switch like param')]
+    [OutputType([string])]
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]
+        $Registry,
+
+        [Parameter()]
+        [PSCredential]
+        $Credential,
+
+        [Parameter()]
+        [CredentialType]
+        $CredentialType = [CredentialType]::Default
+    )
+
+    $ErrorActionPreference = 'Stop'
+
+    try {
+        $getParams = @{
+            Endpoint = "_catalog?n=$([Int32]::MaxValue)"
+            Scope = "registry:catalog:*"
+
+            Registry = $Registry
+            Credential = $Credential
+            CredentialType = $CredentialType
+            AllowNoToken = $true
+        }
+        Invoke-OciV2GetRequest @getParams -AllowPagination | Select-Object -ExpandProperty repositories
+    }
+    catch {
+        $PSCmdlet.WriteError($_)
+    }
+}
+
+Export-ModuleMember -Function Get-OciBearerToken, Get-OciPackageManifest, Get-OciPackageTags, Get-OciRegistryPackages, Publish-NupkgToOci

@@ -147,7 +147,9 @@ Function Install-GhcrResource {
 
             try {
                 # In Oci.psm1
-                Get-OciBearerToken -Registry $Detour.Instance.Registry -PackageName $Detour.State.Name
+                $scope = "repository:$($Detour.State.Name):pull"
+                $token = Get-OciBearerToken -Registry $Detour.Instance.Registry -Scope $scope
+                [Net.NetworkCredential]::new('', $token).Password
             }
             catch {
                 $_.ErrorDetails = "Failed to retrieve anonymous token: $_"
