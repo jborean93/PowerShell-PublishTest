@@ -15,11 +15,13 @@ This project validates the complete workflow for publishing PowerShell modules t
 | GitHub Nuget | GitHub Actions | ✅ Built-in `dotnet nuget push` | ✅ PSResourceGet | ❌ Requires GitHub PAT¹ |
 | GitHub OCI | GitHub Actions | ❌ Custom script required² | ❌ PSResourceGet bugs³ | ✅ Yes |
 | Azure Artifacts | Azure Pipelines | ✅ Built-in `DotNetCoreCLI` task | ✅ PSResourceGet | ✅ Yes |
+| Azure Container Registry | N/A⁴ | ✅ PSResourceGet | ✅ PSResourceGet | ✅ Opt in Standard/Premium SKU |
 
 **Footnotes:**
 1. GitHub Nuget requires authentication even for public packages - a GitHub Personal Access Token with `read:packages` scope is needed
 2. GitHub OCI requires a custom `publish_oci.ps1` script due to PSResourceGet's Azure-specific OCI implementation
 3. PSResourceGet has bugs preventing installation from GitHub OCI (token exchange and package prefix issues)
+4. It is possible to use OIDC for both GHA and AZP to authenticate with ACR but that's not tested in this repo
 
 ## Requirements
 
@@ -36,7 +38,7 @@ Both pipelines use reusable PowerShell scripts:
 
 - **`test.ps1`** - Tests the module by importing it and validating the output
 - **`build.ps1`** - Creates a .nupkg file using PSResourceGet
-- **`publish_oci.ps1`** - Publishes a .nupkg to an OCI registry using direct HTTP API calls
+- **`Oci.psm1`** - Various functions that implement the OCI workflow
 
 ### GitHub Actions Pipeline
 
@@ -52,7 +54,7 @@ The GitHub Actions workflow (`.github/workflows/publish.yml`) has two jobs:
     - Only runs on release events (when a release is published with a tag `v*`)
     - Uploads the .nupkg to the GitHub release asset
     - Publishes to GitHub Nuget Registry using `dotnet nuget push`
-    - Publishes to GitHub Container Registry (OCI) using custom `publish_oci.ps1` script
+    - Publishes to GitHub Container Registry (OCI) using custom `Publish-NupkgToOci` in `Oci.psm1`
 
 ### Azure Pipelines Workflow
 
@@ -199,4 +201,21 @@ $repoParams = @{
 Register-PSResourceRepository @repoParams
 
 Install-PSResource -Name PublishTest -Repository AzureArtifacts -TrustRepository
+```
+
+### Azure Container Registry
+
+```powershell
+$registry = 'acrname.azurecr.io'
+
+$repoParams = @{
+    Name = 'ACR'
+    Uri  = "https://$registry"
+}
+Register-PSResourceRepository @repoParams
+
+# For ACR endpoints that require authentication you will want to call Connect-AzAccount before
+# Connect-AzAccount ...
+
+Install-PSResource -Name PublishTest -Repository ACR -TrustRepository
 ```
